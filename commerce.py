@@ -30,7 +30,7 @@ CORS(app)
 DB_CONFIG = {
    "host": os.getenv("DB_HOST", "mysql-victordesigner.alwaysdata.net"),
     "user": os.getenv("DB_USER", "victordesigner"),
-    "password": os.getenv("DB_PASSWORD", ""),
+    "password": os.getenv("DB_PASSWORD", "project_1234"),
     "database": os.getenv("DB_NAME", "victordesigner_e-commerce"),
     "cursorclass": pymysql.cursors.DictCursor,
     "autocommit": False,
