@@ -1,0 +1,8 @@
+# Do not commit a real .env file.
+MPESA_ENVIRONMENT=sandbox
+MPESA_CONSUMER_KEY=GTWADFxIpUfDoNikNGqq1C3023evM6UH
+MPESA_CONSUMER_SECRET=amFbAoUByPV2rM5A
+MPESA_SHORTCODE=174379
+MPESA_PASSKEY=bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919
+# This must be publicly reachable by Safaricom. For local development use an HTTPS tunnel.
+MPESA_CALLBACK_URL=https://sandbox.safaricom.co.ke/callback
