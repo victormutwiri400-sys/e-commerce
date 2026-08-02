@@ -2,10 +2,12 @@ import os
 import base64
 import datetime
 from decimal import Decimal, InvalidOperation
+import random
+from datetime import datetime, timedelta
 from flask_cors import CORS
 import pymysql
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request,session
 from requests.auth import HTTPBasicAuth
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -209,16 +211,99 @@ def login_user():
     if validation_error:
         return validation_error
 
-    user = fetch_one(
-        "SELECT id, name, email, password_hash, role FROM users WHERE email = %s",
-        (data["email"],),
-    )
-    if not user or not check_password_hash(user["password_hash"], data["password"]):
-        return jsonify({"error": "Invalid email or password"}), 401
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    user.pop("password_hash")
-    return jsonify({"message": "Login successful", "user": user})
+    try:
+        cursor.execute(
+            "SELECT id, name, email, password_hash, role FROM users WHERE email = %s",
+            (data["email"],)
+        )
+        user = cursor.fetchone()
 
+        if not user or not check_password_hash(user["password_hash"], data["password"]):
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        # Generate a secure 6-digit OTP
+        otp_code = f"{random.randint(0, 999999):06d}"
+        # Set expiration time to 10 minutes from now
+        expires_at = datetime.now() + timedelta(minutes=10)
+
+        # Store OTP in the database linked to the user
+        cursor.execute(
+            "UPDATE users SET otp_code = %s, otp_expires_at = %s WHERE id = %s",
+            (otp_code, expires_at, user["id"])
+        )
+        conn.commit()
+
+        # TODO: Integrate your email sending service here (e.g., Flask-Mail or SendGrid)
+        # send_email(user["email"], "Your Login OTP", f"Your verification code is: {otp_code}")
+        print(f"DEBUG OTP for {user['email']}: {otp_code}") # Remove in production
+
+        return jsonify({
+            "message": "Password verified. Please check your email for the OTP confirmation code.",
+            "email": user["email"]
+        }), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "An internal error occurred."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ==================== STEP 2: VERIFY OTP & COMPLETE LOGIN ====================
+
+from datetime import datetime
+
+@app.post("/verify-login-otp")
+def verify_login_otp():
+    data = request.get_json(silent=True) or {}
+    validation_error = require_fields(data, ["email", "otp_code"])
+    if validation_error:
+        return validation_error
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT id, name, email, role, otp_code, otp_expires_at FROM users WHERE email = %s",
+            (data["email"],)
+        )
+        user = cursor.fetchone()
+
+        if not user or not user["otp_code"] or str(user["otp_code"]) != str(data["otp_code"]):
+            return jsonify({"error": "Invalid verification code."}), 400
+
+        # Check if OTP has expired using safe comparison
+        if user["otp_expires_at"] and datetime.now() > user["otp_expires_at"]:
+            return jsonify({"error": "Verification code has expired. Please log in again."}), 400
+
+        # Clear the OTP fields so codes cannot be reused
+        cursor.execute(
+            "UPDATE users SET otp_code = NULL, otp_expires_at = NULL WHERE id = %s",
+            (user["id"],)
+        )
+        conn.commit()
+
+        # Establish user session securely
+        session['user_id'] = user["id"]
+
+        # Clean user object for frontend response
+        user.pop("otp_code", None)
+        user.pop("otp_expires_at", None)
+
+        return jsonify({"message": "Login successful", "user": user}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print(f"OTP Verification Error: {e}") # This will show the exact error in your terminal if anything else happens
+        return jsonify({"error": "An internal error occurred."}), 500
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.get("/users")
 def get_users():
@@ -702,3 +787,185 @@ def update_order_status(order_id):
 def get_order_items():
     order_items = fetch_all("SELECT * FROM order_items ORDER BY id DESC")
     return jsonify(order_items)
+
+@app.get("/api/cart")
+def get_cart():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized. Please log in."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        query = """
+            SELECT c.id, c.product_id, c.quantity, p.title, p.price, p.image_url 
+            FROM cart c 
+            JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        cart_items = cursor.fetchall()
+        return jsonify(cart_items), 200
+
+    except Exception as e:
+        print("CART GET ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+        
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart', methods=['POST'])
+def add_to_cart():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access. Please log in."}), 401
+        
+    data = request.get_json()
+    product_id = data.get('product_id')
+    quantity = data.get('quantity', 1)
+
+    if not product_id:
+        return jsonify({"error": "Product ID is required."}), 400
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id, quantity FROM cart WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        existing_item = cursor.fetchone()
+
+        if existing_item:
+            new_quantity = existing_item['quantity'] + int(quantity)
+            cursor.execute("UPDATE cart SET quantity = %s WHERE id = %s", (new_quantity, existing_item['id']))
+        else:
+            cursor.execute("INSERT INTO cart (user_id, product_id, quantity) VALUES (%s, %s, %s)", (user_id, product_id, quantity))
+        
+        conn.commit()
+        return jsonify({"message": "Item added to cart successfully."}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to add item to cart."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart/<int:item_id>', methods=['DELETE'])
+def remove_from_cart(item_id):
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("DELETE FROM cart WHERE id = %s AND user_id = %s", (item_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Item not found or unauthorized."}), 404
+            
+        return jsonify({"message": "Item removed from cart."}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to remove item."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ==================== WISHLIST ENDPOINTS ====================
+
+@app.get("/api/wishlist")
+def get_wishlist():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized. Please log in."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        query = """
+            SELECT w.id, w.product_id, p.title, p.price, p.image_url 
+            FROM wishlist w 
+            JOIN products p ON w.product_id = p.id 
+            WHERE w.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        wishlist_items = cursor.fetchall()
+        return jsonify(wishlist_items), 200
+
+    except Exception as e:
+        print("WISHLIST GET ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+        
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/wishlist', methods=['POST'])
+def toggle_wishlist():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    data = request.get_json()
+    product_id = data.get('product_id')
+
+    if not product_id:
+        return jsonify({"error": "Product ID is required."}), 400
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id FROM wishlist WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        existing = cursor.fetchone()
+
+        if existing:
+            cursor.execute("DELETE FROM wishlist WHERE id = %s", (existing['id'],))
+            conn.commit()
+            return jsonify({"message": "Removed from wishlist", "status": "removed"}), 200
+        else:
+            cursor.execute("INSERT INTO wishlist (user_id, product_id) VALUES (%s, %s)", (user_id, product_id))
+            conn.commit()
+            return jsonify({"message": "Added to wishlist", "status": "added"}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to update wishlist."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/api/wishlist/<int:product_id>")
+def remove_from_wishlist(product_id):
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized. Please log in."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "DELETE FROM wishlist WHERE user_id = %s AND product_id = %s",
+            (user_id, product_id)
+        )
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({"message": "Product not found in wishlist."}), 404
+            
+        return jsonify({"message": "Product removed from wishlist successfully."}), 200
+
+    except Exception as e:
+        conn.rollback()
+        print("WISHLIST DELETE ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+        
+    finally:
+        cursor.close()
+        conn.close()
