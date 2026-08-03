@@ -28,6 +28,8 @@ def load_environment_file(filename=".env"):
 load_environment_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 app = Flask(__name__)
 app.secret_key = '5209'
+app.config['SESSION_COOKIE_SECURE'] = True      
+app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 CORS(app)
 
 DB_CONFIG = {
