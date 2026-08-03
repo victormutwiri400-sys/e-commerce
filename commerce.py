@@ -8,6 +8,8 @@ import requests
 from flask import Flask, jsonify, request
 from requests.auth import HTTPBasicAuth
 from werkzeug.security import check_password_hash, generate_password_hash
+from dotenv import load_dotenv
+load_dotenv()
 
 
 def load_environment_file(filename=".env"):
