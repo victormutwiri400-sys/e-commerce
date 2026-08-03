@@ -198,22 +198,94 @@ def create_user():
     return jsonify(fetch_one("SELECT id, name, email, role FROM users WHERE id = %s", (user_id,))), 201
 
 
-@app.post("/login")
-def login_user():
-    data = request.get_json(silent=True) or {}
-    validation_error = require_fields(data, ["email", "password"])
-    if validation_error:
-        return validation_error
+@app.route("/api/signin", methods=["POST"])
+def signin():
+    # Support both JSON payload (Axios) and traditional form data
+    data = request.get_json(silent=True) or request.form
+    email = data.get("email")
+    password = data.get("password")
 
-    user = fetch_one(
-        "SELECT id, name, email, password_hash, role FROM users WHERE email = %s",
-        (data["email"],),
-    )
-    if not user or not check_password_hash(user["password_hash"], data["password"]):
-        return jsonify({"error": "Invalid email or password"}), 401
+    if not email or not password:
+        return jsonify({"message": "Email and password are required"}), 400
 
-    user.pop("password_hash")
-    return jsonify({"message": "Login successful", "user": user})
+    connection = get_db_connection()
+    cursor = connection.cursor(pymysql.cursors.DictCursor)
+
+    try:
+        # 1. Check regular users
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+        user = cursor.fetchone()
+        
+        # Fixed: using user['password_hash'] instead of user['password']
+        if user and check_password_hash(user['password_hash'], password):
+            session['user_id'] = user['id']
+            session['role'] = 'user'
+            connection.close()
+            return jsonify({"message": "login successful", "role": "user", "user": user}), 200
+
+        # 2. Check admins (assuming admins table still uses 'password')
+        cursor.execute("SELECT * FROM admins WHERE email = %s", (email,))
+        admin = cursor.fetchone()
+        
+        if admin and check_password_hash(admin['password'], password):
+            session['user_id'] = admin['id']
+            session['role'] = 'admin'
+            connection.close()
+            return jsonify({"message": "login successful", "role": "admin", "admin": admin}), 200
+
+        connection.close()
+        return jsonify({"message": "Invalid email or password"}), 401
+
+    except Exception as e:
+        print("SIGNIN ERROR:", e) # Prints exact error in your terminal for debugging
+        connection.close()
+        return jsonify({"error": "An internal error occurred."}), 500
+
+
+@app.route("/api/createAdmin", methods=["POST"])
+def create_admin():
+    # Ensure only a logged-in superadmin can create new admins
+    if 'user_id' not in session:
+        return jsonify({"message": "Unauthorized access. Please log in."}), 401
+
+    data = request.get_json(silent=True) or request.form
+    
+    admin_email = data.get("admin_email")
+    admin_password = data.get("admin_password")
+    
+    name = data.get("name")
+    new_email = data.get("email")
+    new_password = data.get("new_password")
+    phone = data.get("phone")
+
+    connection = get_db_connection()
+    # Fixed: Use DictCursor so column names can be accessed as dictionary keys
+    cursor = connection.cursor(pymysql.cursors.DictCursor)
+
+    try:
+        # Verify the requesting user is a superadmin
+        cursor.execute("SELECT * FROM admins WHERE id = %s AND role = 'superadmin'", (session['user_id'],))
+        superadmin = cursor.fetchone()
+
+        if not superadmin or not check_password_hash(superadmin['password'], admin_password):
+            connection.close()
+            return jsonify({"message": "unauthorized"}), 403
+
+        # Hash the new admin's password before saving to the database
+        hashed_password = generate_password_hash(new_password)
+        
+        insert_sql = "INSERT INTO admins (username, email, password, phone, role) VALUES (%s, %s, %s, %s, 'admin')"
+        cursor.execute(insert_sql, (name, new_email, hashed_password, phone))
+        connection.commit()
+        connection.close()
+        
+        return jsonify({"message": "admin account created successfully"}), 201
+
+    except Exception as e:
+        connection.rollback()
+        connection.close()
+        print("CREATE ADMIN ERROR:", e) # Prints the exact error in your terminal
+        return jsonify({"error": str(e)}), 500
 
 
 @app.get("/users")
@@ -841,6 +913,182 @@ def toggle_wishlist():
     except Exception as e:
         conn.rollback()
         return jsonify({"error": "Failed to update wishlist."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart', methods=['GET'])
+def get_cart():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access. Please log in."}), 401
+    
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    
+    try:
+        # Fixed: changed p.name to p.title to match your products table structure
+        query = """
+            SELECT c.id, c.product_id, c.quantity, p.title, p.price, p.image_url 
+            FROM cart c 
+            JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        cart_items = cursor.fetchall()
+        return jsonify(cart_items), 200
+    except Exception as e:
+        print("GET CART ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart', methods=['POST'])
+def add_to_cart():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access. Please log in."}), 401
+        
+    data = request.get_json()
+    product_id = data.get('product_id')
+    quantity = data.get('quantity', 1)
+
+    if not product_id:
+        return jsonify({"error": "Product ID is required."}), 400
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id, quantity FROM cart WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        existing_item = cursor.fetchone()
+
+        if existing_item:
+            new_quantity = existing_item['quantity'] + int(quantity)
+            cursor.execute("UPDATE cart SET quantity = %s WHERE id = %s", (new_quantity, existing_item['id']))
+        else:
+            cursor.execute("INSERT INTO cart (user_id, product_id, quantity) VALUES (%s, %s, %s)", (user_id, product_id, quantity))
+        
+        conn.commit()
+        return jsonify({"message": "Item added to cart successfully."}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to add item to cart."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart/<int:item_id>', methods=['DELETE'])
+def remove_from_cart(item_id):
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("DELETE FROM cart WHERE id = %s AND user_id = %s", (item_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Item not found or unauthorized."}), 404
+            
+        return jsonify({"message": "Item removed from cart."}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to remove item."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ==================== WISHLIST ENDPOINTS ====================
+
+@app.route('/api/wishlist', methods=['GET'])
+def get_wishlist():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    # Fixed: Added DictCursor so rows return as dictionaries
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+
+    try:
+        # Fixed: changed p.name to p.title to match your products table
+        query = """
+            SELECT w.id, w.product_id, p.title, p.price, p.image_url 
+            FROM wishlist w 
+            JOIN products p ON w.product_id = p.id 
+            WHERE w.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        wishlist_items = cursor.fetchall()
+        return jsonify(wishlist_items), 200
+    except Exception as e:
+        print("WISHLIST GET ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/wishlist', methods=['POST'])
+def toggle_wishlist():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    data = request.get_json()
+    product_id = data.get('product_id')
+
+    if not product_id:
+        return jsonify({"error": "Product ID is required."}), 400
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id FROM wishlist WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        existing = cursor.fetchone()
+
+        if existing:
+            cursor.execute("DELETE FROM wishlist WHERE id = %s", (existing['id'],))
+            conn.commit()
+            return jsonify({"message": "Removed from wishlist", "status": "removed"}), 200
+        else:
+            cursor.execute("INSERT INTO wishlist (user_id, product_id) VALUES (%s, %s)", (user_id, product_id))
+            conn.commit()
+            return jsonify({"message": "Added to wishlist", "status": "added"}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to update wishlist."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/wishlist/<int:item_id>', methods=['DELETE'])
+def remove_from_wishlist(item_id):
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("DELETE FROM wishlist WHERE id = %s AND user_id = %s", (item_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Item not found or unauthorized."}), 404
+            
+        return jsonify({"message": "Item removed from wishlist."}), 200
+    except Exception as e:
+        conn.rollback()
+        print("WISHLIST DELETE ERROR:", e)
+        return jsonify({"error": "Failed to remove item."}), 500
     finally:
         cursor.close()
         conn.close()
