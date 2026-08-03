@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from flask_cors import CORS
 import pymysql
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request,session
 from requests.auth import HTTPBasicAuth
 from werkzeug.security import check_password_hash, generate_password_hash
 from dotenv import load_dotenv
@@ -52,24 +52,18 @@ MPESA_CALLBACK_URL = os.getenv("MPESA_CALLBACK_URL")
 
 
 def mpesa_config_error():
-    required = {
-        "MPESA_CONSUMER_KEY": MPESA_CONSUMER_KEY,
-        "MPESA_CONSUMER_SECRET": MPESA_CONSUMER_SECRET,
-        "MPESA_SHORTCODE": MPESA_SHORTCODE,
-        "MPESA_PASSKEY": MPESA_PASSKEY,
-        "MPESA_CALLBACK_URL": MPESA_CALLBACK_URL,
-    }
-    missing = [
-        name
-        for name, value in required.items()
-        if not value
-        or value.startswith("replace_with_")
-        or "your-public-domain.example" in value
+    required_vars = [
+        "MPESA_CONSUMER_KEY",
+        "MPESA_CONSUMER_SECRET",
+        "MPESA_SHORTCODE",
+        "MPESA_PASSKEY",
+        "MPESA_CALLBACK_URL"
     ]
+    
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
     if missing:
         return f"M-Pesa is not configured. Missing: {', '.join(missing)}"
-    if not MPESA_CALLBACK_URL.startswith("https://"):
-        return "MPESA_CALLBACK_URL must be a public HTTPS URL"
     return None
 
 
@@ -704,3 +698,149 @@ def update_order_status(order_id):
 def get_order_items():
     order_items = fetch_all("SELECT * FROM order_items ORDER BY id DESC")
     return jsonify(order_items)
+
+@app.route('/api/cart', methods=['GET'])
+def get_cart():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access. Please log in."}), 401
+    
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        query = """
+            SELECT c.id, c.product_id, c.quantity, p.name, p.price, p.image_url 
+            FROM cart c 
+            JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        cart_items = cursor.fetchall()
+        return jsonify(cart_items), 200
+    except Exception as e:
+        return jsonify({"error": "An internal error occurred."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart', methods=['POST'])
+def add_to_cart():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access. Please log in."}), 401
+        
+    data = request.get_json()
+    product_id = data.get('product_id')
+    quantity = data.get('quantity', 1)
+
+    if not product_id:
+        return jsonify({"error": "Product ID is required."}), 400
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id, quantity FROM cart WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        existing_item = cursor.fetchone()
+
+        if existing_item:
+            new_quantity = existing_item['quantity'] + int(quantity)
+            cursor.execute("UPDATE cart SET quantity = %s WHERE id = %s", (new_quantity, existing_item['id']))
+        else:
+            cursor.execute("INSERT INTO cart (user_id, product_id, quantity) VALUES (%s, %s, %s)", (user_id, product_id, quantity))
+        
+        conn.commit()
+        return jsonify({"message": "Item added to cart successfully."}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to add item to cart."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/cart/<int:item_id>', methods=['DELETE'])
+def remove_from_cart(item_id):
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("DELETE FROM cart WHERE id = %s AND user_id = %s", (item_id, user_id))
+        conn.commit()
+        
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Item not found or unauthorized."}), 404
+            
+        return jsonify({"message": "Item removed from cart."}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to remove item."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ==================== WISHLIST ENDPOINTS ====================
+
+@app.route('/api/wishlist', methods=['GET'])
+def get_wishlist():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        query = """
+            SELECT w.id, w.product_id, p.name, p.price, p.image_url 
+            FROM wishlist w 
+            JOIN products p ON w.product_id = p.id 
+            WHERE w.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        wishlist_items = cursor.fetchall()
+        return jsonify(wishlist_items), 200
+    except Exception as e:
+        return jsonify({"error": "An internal error occurred."}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/api/wishlist', methods=['POST'])
+def toggle_wishlist():
+    if 'user_id' not in session:
+        return jsonify({"error": "Unauthorized access."}), 401
+
+    data = request.get_json()
+    product_id = data.get('product_id')
+
+    if not product_id:
+        return jsonify({"error": "Product ID is required."}), 400
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id FROM wishlist WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        existing = cursor.fetchone()
+
+        if existing:
+            cursor.execute("DELETE FROM wishlist WHERE id = %s", (existing['id'],))
+            conn.commit()
+            return jsonify({"message": "Removed from wishlist", "status": "removed"}), 200
+        else:
+            cursor.execute("INSERT INTO wishlist (user_id, product_id) VALUES (%s, %s)", (user_id, product_id))
+            conn.commit()
+            return jsonify({"message": "Added to wishlist", "status": "added"}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Failed to update wishlist."}), 500
+    finally:
+        cursor.close()
+        conn.close()
