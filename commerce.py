@@ -30,7 +30,14 @@ app = Flask(__name__)
 app.secret_key = '5209'
 app.config['SESSION_COOKIE_SECURE'] = True      
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
-CORS(app)
+CORS(
+    app,
+    supports_credentials=True,
+    origins=[
+        "http://localhost:3000",
+        "http://localhost:5173"
+    ]
+)
 
 DB_CONFIG = {
    "host": os.getenv("DB_HOST", "mysql-victordesigner.alwaysdata.net"),
