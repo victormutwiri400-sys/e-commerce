@@ -207,10 +207,8 @@ def create_user():
 
     return jsonify(fetch_one("SELECT id, name, email, role FROM users WHERE id = %s", (user_id,))), 201
 
-
 @app.route("/api/signin", methods=["POST"])
 def signin():
-    # Support both JSON payload (Axios) and traditional form data
     data = request.get_json(silent=True) or request.form
     email = data.get("email")
     password = data.get("password")
@@ -222,35 +220,66 @@ def signin():
     cursor = connection.cursor(pymysql.cursors.DictCursor)
 
     try:
-        # 1. Check regular users
-        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+        cursor.execute("SELECT * FROM users WHERE email=%s", (email,))
         user = cursor.fetchone()
-        
-        # Fixed: using user['password_hash'] instead of user['password']
-        if user and check_password_hash(user['password_hash'], password):
-            session['user_id'] = user['id']
-            session['role'] = 'user'
-            connection.close()
-            return jsonify({"message": "login successful", "role": "user", "user": user}), 200
 
-        # 2. Check admins (assuming admins table still uses 'password')
-        cursor.execute("SELECT * FROM admins WHERE email = %s", (email,))
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]
+            session["role"] = "user"
+            user.pop("password_hash", None)
+            return jsonify({"message":"Login successful","role":"user","user":user}), 200
+
+        cursor.execute("SELECT * FROM admins WHERE email=%s", (email,))
         admin = cursor.fetchone()
-        
-        if admin and check_password_hash(admin['password'], password):
-            session['user_id'] = admin['id']
-            session['role'] = 'admin'
-            connection.close()
-            return jsonify({"message": "login successful", "role": "admin", "admin": admin}), 200
 
-        connection.close()
-        return jsonify({"message": "Invalid email or password"}), 401
+        if admin and check_password_hash(admin["password"], password):
+            session["user_id"] = admin["id"]
+            session["role"] = "admin"
+            admin.pop("password", None)
+            return jsonify({"message":"Login successful","role":"admin","admin":admin}), 200
+
+        return jsonify({"message":"Invalid email or password"}), 401
 
     except Exception as e:
-        print("SIGNIN ERROR:", e) # Prints exact error in your terminal for debugging
-        connection.close()
-        return jsonify({"error": "An internal error occurred."}), 500
+        print("SIGNIN ERROR:", e)
+        return jsonify({"error":"Internal server error"}), 500
 
+    finally:
+        cursor.close()
+        connection.close()
+
+
+@app.route("/api/me", methods=["GET"])
+def me():
+    if "user_id" not in session:
+        return jsonify({"authenticated":False}), 401
+
+    connection = get_db_connection()
+    cursor = connection.cursor(pymysql.cursors.DictCursor)
+
+    try:
+        table = "admins" if session["role"] == "admin" else "users"
+        cursor.execute(f"SELECT id,name,email FROM {table} WHERE id=%s", (session["user_id"],))
+        account = cursor.fetchone()
+
+        if not account:
+            return jsonify({"authenticated":False}), 401
+
+        return jsonify({
+            "authenticated":True,
+            "role":session["role"],
+            session["role"]:account
+        }), 200
+
+    finally:
+        cursor.close()
+        connection.close()
+
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"message":"Logged out successfully"}), 200
 
 @app.route("/api/createAdmin", methods=["POST"])
 def create_admin():
