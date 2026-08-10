@@ -329,13 +329,13 @@ def create_admin():
 
 @app.get("/users")
 def get_users():
-    users = fetch_all("SELECT id, name, email,FROM users ORDER BY id DESC")
+    users = fetch_all("SELECT id, name, email FROM users ORDER BY id DESC")
     return jsonify(users)
 
 
 @app.get("/users/<int:user_id>")
 def get_user(user_id):
-    user = fetch_one("SELECT id, name, email, role FROM users WHERE id = %s", (user_id,))
+    user = fetch_one("SELECT id, name, email FROM users WHERE id = %s", (user_id,))
     if not user:
         return jsonify({"error": "user not found"}), 404
     return jsonify(user)
