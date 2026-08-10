@@ -299,7 +299,7 @@ def get_users():
 
 @app.get("/users/<int:user_id>")
 def get_user(user_id):
-    user = fetch_one("SELECT id, name, email, FROM users WHERE id = %s", (user_id,))
+    user = fetch_one("SELECT id, name, email, role FROM users WHERE id = %s", (user_id,))
     if not user:
         return jsonify({"error": "user not found"}), 404
     return jsonify(user)
