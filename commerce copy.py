@@ -293,7 +293,7 @@ def create_admin():
 
 @app.get("/users")
 def get_users():
-    users = fetch_all("SELECT id, name, email, role FROM users ORDER BY id DESC")
+    users = fetch_all("SELECT id, name, email, FROM users ORDER BY id DESC")
     return jsonify(users)
 
 
