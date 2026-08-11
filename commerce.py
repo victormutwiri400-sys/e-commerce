@@ -625,7 +625,7 @@ def get_order_payload(order_id):
 
     order["items"] = fetch_all(
         """
-        SELECT oi.id, oi.order_id, oi.product_id, p.title, oi.quantity, oi.price_at_purchase
+        SELECT oi.id, oi.order_id, oi.product_id, p.title, p.image_url, oi.quantity, oi.price_at_purchase
         FROM order_items oi
         JOIN products p ON p.id = oi.product_id
         WHERE oi.order_id = %s
