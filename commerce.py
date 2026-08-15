@@ -556,6 +556,7 @@ def create_order():
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
+            # 1. Verify user exists
             cursor.execute("SELECT id FROM users WHERE id = %s", (data["user_id"],))
             if not cursor.fetchone():
                 connection.rollback()
@@ -566,6 +567,7 @@ def create_order():
                 connection.rollback()
                 return jsonify({"error": "Each item must include product_id"}), 400
 
+            # 2. Fetch products and prices
             placeholders = ", ".join(["%s"] * len(product_ids))
             cursor.execute(
                 f"SELECT id, price FROM products WHERE id IN ({placeholders})",
@@ -575,20 +577,39 @@ def create_order():
 
             total_amount = Decimal("0.00")
             order_items = []
+
             for item in data["items"]:
-                product = products.get(item["product_id"])
+                prod_id = item["product_id"]
+                product = products.get(prod_id)
                 quantity = int(item.get("quantity", 1))
+
                 if not product:
                     connection.rollback()
-                    return jsonify({"error": f"Product {item['product_id']} not found"}), 404
+                    return jsonify({"error": f"Product {prod_id} not found"}), 404
                 if quantity <= 0:
                     connection.rollback()
                     return jsonify({"error": "Quantity must be greater than 0"}), 400
 
+                # Check and find a variant with enough stock for this product
+                cursor.execute(
+                    """
+                    SELECT id, stock_quantity FROM product_variants 
+                    WHERE product_id = %s AND stock_quantity >= %s 
+                    LIMIT 1
+                    """,
+                    (prod_id, quantity)
+                )
+                variant = cursor.fetchone()
+                if not variant:
+                    connection.rollback()
+                    return jsonify({"error": f"Insufficient stock or no variants available for product {prod_id}"}), 400
+
                 price = product["price"]
                 total_amount += price * quantity
-                order_items.append((item["product_id"], quantity, price))
+                # Save product_id, quantity, price, and the specific variant id to update later
+                order_items.append((prod_id, quantity, price, variant["id"]))
 
+            # 3. Insert into orders table
             cursor.execute(
                 """
                 INSERT INTO orders (user_id, total_amount, status)
@@ -598,20 +619,31 @@ def create_order():
             )
             order_id = cursor.lastrowid
 
-            for product_id, quantity, price in order_items:
+            # 4. Insert into order_items (using your exact table columns) AND decrement stock
+            for prod_id, quantity, price, variant_id in order_items:
                 cursor.execute(
                     """
                     INSERT INTO order_items
                     (order_id, product_id, quantity, price_at_purchase)
                     VALUES (%s, %s, %s, %s)
                     """,
-                    (order_id, product_id, quantity, price),
+                    (order_id, prod_id, quantity, price),
+                )
+
+                # Decrement stock from the product_variants table
+                cursor.execute(
+                    """
+                    UPDATE product_variants 
+                    SET stock_quantity = stock_quantity - %s 
+                    WHERE id = %s
+                    """,
+                    (quantity, variant_id),
                 )
 
         connection.commit()
-    except Exception:
+    except Exception as e:
         connection.rollback()
-        raise
+        return jsonify({"error": "Database error", "details": str(e)}), 500
     finally:
         connection.close()
 
@@ -623,9 +655,20 @@ def get_order_payload(order_id):
     if not order:
         return None
 
+    # This joins order_items with products AND grabs the first available variant's size/color for the view details page
     order["items"] = fetch_all(
         """
-        SELECT oi.id, oi.order_id, oi.product_id, p.title, p.image_url, oi.quantity, oi.price_at_purchase
+        SELECT 
+            oi.id, 
+            oi.order_id, 
+            oi.product_id, 
+            p.title, 
+            p.description, 
+            p.image_url, 
+            oi.quantity, 
+            oi.price_at_purchase,
+            (SELECT color FROM product_variants WHERE product_id = p.id LIMIT 1) as color,
+            (SELECT size FROM product_variants WHERE product_id = p.id LIMIT 1) as size
         FROM order_items oi
         JOIN products p ON p.id = oi.product_id
         WHERE oi.order_id = %s
@@ -634,6 +677,31 @@ def get_order_payload(order_id):
         (order_id,),
     )
     return order
+
+
+@app.get("/products-with-stock")
+def get_products_with_stock():
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 
+                    p.id as product_id, 
+                    p.title, 
+                    p.price, 
+                    pv.id as variant_id, 
+                    pv.size, 
+                    pv.color, 
+                    pv.stock_quantity 
+                FROM products p
+                LEFT JOIN product_variants pv ON p.id = pv.product_id
+                """
+            )
+            results = cursor.fetchall()
+        return jsonify(results), 200
+    finally:
+        connection.close()
 
 
 @app.get("/orders")
