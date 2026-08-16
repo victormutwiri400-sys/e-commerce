@@ -734,7 +734,28 @@ def get_products_with_stock():
 
 @app.get("/orders")
 def get_orders():
-    orders = fetch_all("SELECT * FROM orders ORDER BY id DESC")
+    # Include the customer's username and the purchased products (with their
+    # photo) so the admin dashboard/list views can show them directly.
+    orders = fetch_all(
+        """
+        SELECT o.id, o.user_id, o.total_amount, o.status,
+               u.name AS username
+        FROM orders o
+        LEFT JOIN users u ON u.id = o.user_id
+        ORDER BY o.id DESC
+        """,
+    )
+    for order in orders:
+        order["items"] = fetch_all(
+            """
+            SELECT p.title, p.image_url, oi.quantity, oi.price_at_purchase
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = %s
+            ORDER BY oi.id
+            """,
+            (order["id"],),
+        )
     return jsonify(orders)
 
 
