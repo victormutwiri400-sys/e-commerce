@@ -582,6 +582,7 @@ def create_order():
                 prod_id = item["product_id"]
                 product = products.get(prod_id)
                 quantity = int(item.get("quantity", 1))
+                variant_id = item.get("variant_id")  # may be None
 
                 if not product:
                     connection.rollback()
@@ -590,23 +591,47 @@ def create_order():
                     connection.rollback()
                     return jsonify({"error": "Quantity must be greater than 0"}), 400
 
-                # Check and find a variant with enough stock for this product
-                cursor.execute(
-                    """
-                    SELECT id, stock_quantity FROM product_variants 
-                    WHERE product_id = %s AND stock_quantity >= %s 
-                    LIMIT 1
-                    """,
-                    (prod_id, quantity)
-                )
-                variant = cursor.fetchone()
-                if not variant:
-                    connection.rollback()
-                    return jsonify({"error": f"Insufficient stock or no variants available for product {prod_id}"}), 400
+                # Resolve the variant to use for stock decrement.
+                if variant_id is not None:
+                    # User selected a specific variant (size/color) on the frontend.
+                    cursor.execute(
+                        """
+                        SELECT id, stock_quantity FROM product_variants
+                        WHERE id = %s AND product_id = %s
+                        """,
+                        (variant_id, prod_id),
+                    )
+                    variant = cursor.fetchone()
+                    if not variant:
+                        connection.rollback()
+                        return jsonify({
+                            "error": f"Variant {variant_id} not found for product {prod_id}"
+                        }), 404
+                    if variant["stock_quantity"] < quantity:
+                        connection.rollback()
+                        return jsonify({
+                            "error": f"Insufficient stock for product {prod_id} (variant {variant_id})"
+                        }), 400
+                else:
+                    # Backward compatibility: pick the first variant with enough stock.
+                    cursor.execute(
+                        """
+                        SELECT id, stock_quantity FROM product_variants
+                        WHERE product_id = %s AND stock_quantity >= %s
+                        LIMIT 1
+                        """,
+                        (prod_id, quantity),
+                    )
+                    variant = cursor.fetchone()
+                    if not variant:
+                        connection.rollback()
+                        return jsonify({
+                            "error": f"Insufficient stock or no variants available for product {prod_id}"
+                        }), 400
 
                 price = product["price"]
                 total_amount += price * quantity
-                # Save product_id, quantity, price, and the specific variant id to update later
+                # Save product_id, quantity, price, and the resolved variant id
                 order_items.append((prod_id, quantity, price, variant["id"]))
 
             # 3. Insert into orders table
@@ -619,15 +644,15 @@ def create_order():
             )
             order_id = cursor.lastrowid
 
-            # 4. Insert into order_items (using your exact table columns) AND decrement stock
+            # 4. Insert into order_items (with variant_id) AND decrement stock
             for prod_id, quantity, price, variant_id in order_items:
                 cursor.execute(
                     """
                     INSERT INTO order_items
-                    (order_id, product_id, quantity, price_at_purchase)
-                    VALUES (%s, %s, %s, %s)
+                    (order_id, product_id, variant_id, quantity, price_at_purchase)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (order_id, prod_id, quantity, price),
+                    (order_id, prod_id, variant_id, quantity, price),
                 )
 
                 # Decrement stock from the product_variants table
@@ -655,22 +680,25 @@ def get_order_payload(order_id):
     if not order:
         return None
 
-    # This joins order_items with products AND grabs the first available variant's size/color for the view details page
+    # Join order_items with products AND the exact variant that was purchased.
+    # Uses oi.variant_id (stored at order time) so the correct color/size is shown.
     order["items"] = fetch_all(
         """
         SELECT 
             oi.id, 
             oi.order_id, 
             oi.product_id, 
+            oi.variant_id,
             p.title, 
             p.description, 
             p.image_url, 
             oi.quantity, 
             oi.price_at_purchase,
-            (SELECT color FROM product_variants WHERE product_id = p.id LIMIT 1) as color,
-            (SELECT size FROM product_variants WHERE product_id = p.id LIMIT 1) as size
+            pv.color,
+            pv.size
         FROM order_items oi
         JOIN products p ON p.id = oi.product_id
+        LEFT JOIN product_variants pv ON pv.id = oi.variant_id
         WHERE oi.order_id = %s
         ORDER BY oi.id
         """,
@@ -888,11 +916,13 @@ def get_cart():
     cursor = conn.cursor(pymysql.cursors.DictCursor)
     
     try:
-        # Fixed: changed p.name to p.title to match your products table structure
+        # Return variant_id + color/size so the cart can display the selected variant
         query = """
-            SELECT c.id, c.product_id, c.quantity, p.title, p.price, p.image_url 
+            SELECT c.id, c.product_id, c.variant_id, c.quantity, p.title, p.price, p.image_url,
+                   pv.color, pv.size
             FROM cart c 
             JOIN products p ON c.product_id = p.id 
+            LEFT JOIN product_variants pv ON pv.id = c.variant_id
             WHERE c.user_id = %s
         """
         cursor.execute(query, (user_id,))
@@ -913,28 +943,53 @@ def add_to_cart():
     data = request.get_json()
     product_id = data.get('product_id')
     quantity = data.get('quantity', 1)
+    variant_id = data.get('variant_id')  # may be None for products without variants
 
     if not product_id:
         return jsonify({"error": "Product ID is required."}), 400
 
     user_id = session['user_id']
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
 
     try:
-        cursor.execute("SELECT id, quantity FROM cart WHERE user_id = %s AND product_id = %s", (user_id, product_id))
+        # If a variant was selected, verify it belongs to this product
+        if variant_id is not None:
+            cursor.execute(
+                "SELECT id, stock_quantity FROM product_variants WHERE id = %s AND product_id = %s",
+                (variant_id, product_id),
+            )
+            variant = cursor.fetchone()
+            if not variant:
+                return jsonify({"error": "Variant not found for this product."}), 404
+            if variant['stock_quantity'] < int(quantity):
+                return jsonify({"error": "Insufficient stock for selected variant."}), 400
+
+        # Check if this exact product+variant combo is already in the cart
+        cursor.execute(
+            """
+            SELECT id, quantity FROM cart 
+            WHERE user_id = %s AND product_id = %s
+            AND ((%s IS NULL AND variant_id IS NULL) OR variant_id = %s)
+            """,
+            (user_id, product_id, variant_id, variant_id),
+        )
         existing_item = cursor.fetchone()
 
         if existing_item:
             new_quantity = existing_item['quantity'] + int(quantity)
             cursor.execute("UPDATE cart SET quantity = %s WHERE id = %s", (new_quantity, existing_item['id']))
         else:
-            cursor.execute("INSERT INTO cart (user_id, product_id, quantity) VALUES (%s, %s, %s)", (user_id, product_id, quantity))
+            cursor.execute(
+                "INSERT INTO cart (user_id, product_id, variant_id, quantity) VALUES (%s, %s, %s, %s)",
+                (user_id, product_id, variant_id, quantity),
+            )
         
         conn.commit()
         return jsonify({"message": "Item added to cart successfully."}), 201
     except Exception as e:
         conn.rollback()
+        print("ADD TO CART ERROR:", e)
         return jsonify({"error": "Failed to add item to cart."}), 500
     finally:
         cursor.close()
