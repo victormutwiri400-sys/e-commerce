@@ -35,7 +35,10 @@ CORS(
     supports_credentials=True,
     origins=[
         "http://localhost:3000",
-        "http://localhost:5173"
+        "http://localhost:5173",
+        "https://ecommerce-designer9.vercel.app",
+        "https://ecommerce-git-master-designer9.vercel.app",
+        "https://ecommerce-kfrg2z8yx-designer9.vercel.app"
     ]
 )
 
