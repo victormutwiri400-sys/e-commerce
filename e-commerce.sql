@@ -96,7 +96,8 @@ CREATE TABLE `products` (
   `description` text DEFAULT NULL,
   `price` decimal(10,2) NOT NULL,
   `category` enum('books','apparel') NOT NULL,
-  `image_url` varchar(255) NOT NULL,
+  `image_url` text NOT NULL,
+  `image_public_id` varchar(255) DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 

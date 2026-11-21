@@ -1,7 +1,12 @@
 import os
 import base64
 import datetime
+import hashlib
+import hmac
+import ipaddress
+import time
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
 from flask_cors import CORS
 import pymysql
 import requests
@@ -26,8 +31,46 @@ def load_environment_file(filename=".env"):
 
 
 load_environment_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
+REQUIRED_ENVIRONMENT_VARIABLES = (
+    "SECRET_KEY",
+    "DB_HOST",
+    "DB_USER",
+    "DB_PASSWORD",
+    "DB_NAME",
+    "CLOUDINARY_CLOUD_NAME",
+    "CLOUDINARY_API_KEY",
+    "CLOUDINARY_API_SECRET",
+)
+PLACEHOLDER_VALUES = {"change_me", "changeme", "replace_me", "password", "secret"}
+
+
+def validate_startup_configuration():
+    missing = []
+    for name in REQUIRED_ENVIRONMENT_VARIABLES:
+        value = os.getenv(name, "").strip()
+        if not value or value.lower() in PLACEHOLDER_VALUES or value.lower().startswith(("your_", "replace_")):
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            "Flask startup blocked. Set valid values for required environment variable(s): "
+            + ", ".join(missing)
+        )
+
+    secret_key = os.environ["SECRET_KEY"].strip()
+    if len(secret_key.encode("utf-8")) < 43 or len(set(secret_key)) < 16:
+        raise RuntimeError(
+            "Flask startup blocked. SECRET_KEY must be a randomly generated value "
+            "of at least 32 random bytes (43 or more encoded characters)."
+        )
+
+
+validate_startup_configuration()
+
 app = Flask(__name__)
-app.secret_key = '5209'
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+app.secret_key = os.environ["SECRET_KEY"].strip()
 app.config['SESSION_COOKIE_SECURE'] = True      
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 CORS(
@@ -43,13 +86,117 @@ CORS(
 )
 
 DB_CONFIG = {
-   "host": os.getenv("DB_HOST", "mysql-victordesigner.alwaysdata.net"),
-    "user": os.getenv("DB_USER", "victordesigner"),
-    "password": os.getenv("DB_PASSWORD", "project_1234"),
-    "database": os.getenv("DB_NAME", "victordesigner_e-commerce"),
+    "host": os.environ["DB_HOST"].strip(),
+    "user": os.environ["DB_USER"].strip(),
+    "password": os.environ["DB_PASSWORD"],
+    "database": os.environ["DB_NAME"].strip(),
     "cursorclass": pymysql.cursors.DictCursor,
     "autocommit": False,
 }
+
+ALLOWED_CATEGORIES = ("books", "apparel", "TVs", "Laptops", "Flash Drives", "AirPods")
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg": ("jpg", b"\xff\xd8\xff"),
+    "image/png": ("png", b"\x89PNG\r\n\x1a\n"),
+    "image/webp": ("webp", b"RIFF"),
+    "image/gif": ("gif", b"GIF8"),
+}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+CLOUDINARY_CLOUD_NAME = os.environ["CLOUDINARY_CLOUD_NAME"].strip()
+CLOUDINARY_API_KEY = os.environ["CLOUDINARY_API_KEY"].strip()
+CLOUDINARY_API_SECRET = os.environ["CLOUDINARY_API_SECRET"].strip()
+
+
+def require_admin():
+    return session.get("role") == "admin"
+
+
+def cloudinary_configured():
+    return all((CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET))
+
+
+def cloudinary_signature(params):
+    serialized = "&".join(f"{key}={params[key]}" for key in sorted(params))
+    return hmac.new(CLOUDINARY_API_SECRET.encode(), serialized.encode(), hashlib.sha1).hexdigest()
+
+
+def upload_to_cloudinary(file_bytes, content_type):
+    if not cloudinary_configured():
+        raise RuntimeError("Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.")
+    timestamp = str(int(time.time()))
+    params = {"timestamp": timestamp, "folder": "products"}
+    params["signature"] = cloudinary_signature(params)
+    params["api_key"] = CLOUDINARY_API_KEY
+    extension = ALLOWED_IMAGE_TYPES[content_type][0]
+    response = requests.post(
+        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/image/upload",
+        data=params,
+        files={"file": (f"product.{extension}", file_bytes, content_type)},
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        raise ValueError("Cloudinary could not upload this image")
+    result = response.json()
+    if not result.get("secure_url") or not result.get("public_id"):
+        raise ValueError("Cloudinary returned an incomplete upload result")
+    return result["secure_url"], result["public_id"]
+
+
+def delete_cloudinary_asset(public_id):
+    if not public_id or not cloudinary_configured():
+        return
+    timestamp = str(int(time.time()))
+    params = {"public_id": public_id, "timestamp": timestamp}
+    params["signature"] = cloudinary_signature(params)
+    params["api_key"] = CLOUDINARY_API_KEY
+    response = requests.post(
+        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/image/destroy",
+        data=params,
+        timeout=20,
+    )
+    response.raise_for_status()
+
+
+def image_asset_token(image_url, public_id):
+    payload = f"{image_url}\n{public_id}".encode()
+    return hmac.new(CLOUDINARY_API_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+
+
+def valid_cloudinary_asset(data):
+    public_id = data.get("image_public_id")
+    token = data.get("image_asset_token")
+    image_url = data.get("image_url", "")
+    parsed_image = urlparse(image_url)
+    expected_path = f"/{CLOUDINARY_CLOUD_NAME}/image/upload/" if CLOUDINARY_CLOUD_NAME else None
+    return bool(
+        public_id and token and cloudinary_configured()
+        and parsed_image.scheme == "https"
+        and parsed_image.hostname == "res.cloudinary.com"
+        and expected_path in parsed_image.path
+        and hmac.compare_digest(str(token), image_asset_token(image_url, public_id))
+    )
+
+
+def validate_external_image_url(value):
+    if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 32 or c.isspace() for c in value):
+        return False
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname in ("localhost",) or hostname.endswith((".localhost", ".local", ".internal")):
+            return False
+        try:
+            address = ipaddress.ip_address(hostname)
+            if not address.is_global:
+                return False
+        except ValueError:
+            if "." not in hostname:
+                return False
+        return True
+    except ValueError:
+        return False
 
 MPESA_ENVIRONMENT = os.getenv("MPESA_ENVIRONMENT", "sandbox").lower()
 MPESA_BASE_URL = (
@@ -346,28 +493,38 @@ def get_user(user_id):
 
 @app.post("/products")
 def create_product():
+    if not require_admin():
+        return jsonify({"error": "Admin access required"}), 403
     data = request.get_json(silent=True) or {}
     validation_error = require_fields(data, ["title", "price", "category", "image_url"])
     if validation_error:
         return validation_error
 
-    if data["category"] not in ("books", "apparel"):
-        return jsonify({"error": "Category must be 'books' or 'apparel'"}), 400
+    if data["category"] not in ALLOWED_CATEGORIES:
+        return jsonify({"error": f"Category must be one of: {', '.join(ALLOWED_CATEGORIES)}"}), 400
+    image_url = data.get("image_url", "")
+    public_id = data.get("image_public_id")
+    if public_id:
+        if not valid_cloudinary_asset(data):
+            return jsonify({"error": "Cloudinary image metadata is invalid. Upload the image again."}), 400
+    elif not validate_external_image_url(image_url):
+        return jsonify({"error": "Image URL must be a valid public HTTP or HTTPS URL"}), 400
 
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO products (title, description, price, category, image_url)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO products (title, description, price, category, image_url, image_public_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     data["title"],
                     data.get("description"),
                     data["price"],
                     data["category"],
-                    data["image_url"],
+                    image_url,
+                    public_id,
                 ),
             )
             product_id = cursor.lastrowid
@@ -397,6 +554,37 @@ def get_products():
     return jsonify(products)
 
 
+@app.post("/admin/products/images/upload")
+def upload_product_image():
+    if not require_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    image = request.files.get("image")
+    if not image or not image.filename:
+        return jsonify({"error": "Choose an image file to upload"}), 400
+    content_type = (image.mimetype or "").lower()
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        return jsonify({"error": "Image must be JPEG, PNG, WebP, or GIF"}), 400
+    contents = image.read(MAX_IMAGE_BYTES + 1)
+    if not contents or len(contents) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "Image must be smaller than 5 MB"}), 400
+    signature = ALLOWED_IMAGE_TYPES[content_type][1]
+    if not contents.startswith(signature) or (content_type == "image/webp" and contents[8:12] != b"WEBP"):
+        return jsonify({"error": "The selected file does not match its image type"}), 400
+    try:
+        image_url, public_id = upload_to_cloudinary(contents, content_type)
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 503
+    except (requests.RequestException, ValueError) as error:
+        app.logger.warning("Cloudinary product image upload failed: %s", error)
+        return jsonify({"error": "Image upload failed. Check the image and Cloudinary configuration, then retry."}), 502
+    return jsonify({
+        "image_url": image_url,
+        "image_public_id": public_id,
+        "image_asset_token": image_asset_token(image_url, public_id),
+        "image_source": "cloudinary",
+    }), 201
+
+
 @app.get("/products/<int:product_id>")
 def get_product(product_id):
     product = fetch_one("SELECT * FROM products WHERE id = %s", (product_id,))
@@ -412,13 +600,30 @@ def get_product(product_id):
 
 @app.put("/products/<int:product_id>")
 def update_product(product_id):
+    if not require_admin():
+        return jsonify({"error": "Admin access required"}), 403
     data = request.get_json(silent=True) or {}
     allowed_fields = ["title", "description", "price", "category", "image_url"]
     updates = []
     params = []
 
-    if data.get("category") and data["category"] not in ("books", "apparel"):
-        return jsonify({"error": "Category must be 'books' or 'apparel'"}), 400
+    if data.get("category") and data["category"] not in ALLOWED_CATEGORIES:
+        return jsonify({"error": f"Category must be one of: {', '.join(ALLOWED_CATEGORIES)}"}), 400
+
+    old = fetch_one("SELECT image_public_id FROM products WHERE id = %s", (product_id,))
+    if not old:
+        return jsonify({"error": "Product not found"}), 404
+    replacement_public_id = old.get("image_public_id")
+    replacing_image = "image_url" in data
+    if replacing_image:
+        replacement_public_id = data.get("image_public_id")
+        if replacement_public_id:
+            if not valid_cloudinary_asset(data):
+                return jsonify({"error": "Cloudinary image metadata is invalid. Upload the image again."}), 400
+        elif not validate_external_image_url(data["image_url"]):
+            return jsonify({"error": "Image URL must be a valid public HTTP or HTTPS URL"}), 400
+        updates.append("image_public_id = %s")
+        params.append(replacement_public_id)
 
     for field in allowed_fields:
         if field in data:
@@ -443,11 +648,21 @@ def update_product(product_id):
     finally:
         connection.close()
 
+    if replacing_image and old.get("image_public_id") and old["image_public_id"] != replacement_public_id:
+        try:
+            delete_cloudinary_asset(old["image_public_id"])
+        except Exception as error:
+            app.logger.warning("Could not delete replaced Cloudinary product image: %s", error)
     return jsonify(fetch_one("SELECT * FROM products WHERE id = %s", (product_id,)))
 
 
 @app.delete("/products/<int:product_id>")
 def delete_product(product_id):
+    if not require_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    product = fetch_one("SELECT image_public_id FROM products WHERE id = %s", (product_id,))
+    if not product:
+        return jsonify({"error": "Product not found"}), 404
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
@@ -459,6 +674,11 @@ def delete_product(product_id):
     finally:
         connection.close()
 
+    if product.get("image_public_id"):
+        try:
+            delete_cloudinary_asset(product["image_public_id"])
+        except Exception as error:
+            app.logger.warning("Could not delete Cloudinary image for deleted product: %s", error)
     return jsonify({"message": "Product deleted"})
 
 
