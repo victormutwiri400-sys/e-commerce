@@ -1,3 +1,7 @@
 flask
 flask-cors
+PyMySQL
+requests
+python-dotenv
+Werkzeug
 cloudinary
