@@ -47,8 +47,12 @@ PLACEHOLDER_VALUES = {"change_me", "changeme", "replace_me", "password", "secret
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
-app.secret_key = os.environ["SECRET_KEY"].strip()
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES + 64 * 1024
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable must be configured")
+app.secret_key = SECRET_KEY
 app.config['SESSION_COOKIE_SECURE'] = True      
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 CORS(
@@ -79,7 +83,6 @@ ALLOWED_IMAGE_TYPES = {
     "image/webp": ("webp", b"RIFF"),
     "image/gif": ("gif", b"GIF8"),
 }
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "").strip()
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "").strip()
@@ -95,28 +98,65 @@ def cloudinary_configured():
 
 def cloudinary_signature(params):
     serialized = "&".join(f"{key}={params[key]}" for key in sorted(params))
-    return hmac.new(CLOUDINARY_API_SECRET.encode(), serialized.encode(), hashlib.sha1).hexdigest()
+    return hashlib.sha1(f"{serialized}{CLOUDINARY_API_SECRET}".encode()).hexdigest()
 
 
-def upload_to_cloudinary(file_bytes, content_type):
+def upload_to_cloudinary(file_bytes=None, content_type=None, source_url=None):
     if not cloudinary_configured():
         raise RuntimeError("Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.")
+    if (file_bytes is None) == (source_url is None):
+        raise ValueError("Provide either image bytes or an image URL")
     timestamp = str(int(time.time()))
     params = {"timestamp": timestamp, "folder": "products"}
     params["signature"] = cloudinary_signature(params)
     params["api_key"] = CLOUDINARY_API_KEY
-    extension = ALLOWED_IMAGE_TYPES[content_type][0]
-    response = requests.post(
-        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/image/upload",
-        data=params,
-        files={"file": (f"product.{extension}", file_bytes, content_type)},
-        timeout=30,
-    )
+    upload_endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/image/upload"
+    if source_url:
+        params["file"] = source_url
+        response = requests.post(upload_endpoint, data=params, timeout=30)
+    else:
+        if content_type not in ALLOWED_IMAGE_TYPES:
+            raise ValueError("Unsupported image type")
+        extension = ALLOWED_IMAGE_TYPES[content_type][0]
+        response = requests.post(
+            upload_endpoint,
+            data=params,
+            files={"file": (f"product.{extension}", file_bytes, content_type)},
+            timeout=30,
+        )
     if response.status_code >= 400:
-        raise ValueError("Cloudinary could not upload this image")
+        message = None
+        try:
+            response_data = response.json()
+            if isinstance(response_data, dict):
+                error_data = response_data.get("error")
+                if isinstance(error_data, dict) and isinstance(error_data.get("message"), str):
+                    message = error_data["message"]
+        except ValueError:
+            app.logger.debug("Cloudinary returned a non-JSON error response (HTTP %s)", response.status_code)
+        if message and source_url:
+            message = message.replace(source_url, "[image URL]")
+        detail = f"Cloudinary rejected the image (HTTP {response.status_code})"
+        if message:
+            detail = f"{detail}: {message[:200]}"
+        raise ValueError(detail)
     result = response.json()
-    if not result.get("secure_url") or not result.get("public_id"):
-        raise ValueError("Cloudinary returned an incomplete upload result")
+    if not isinstance(result, dict):
+        raise ValueError("Cloudinary returned an invalid upload result")
+    if (
+        not result.get("secure_url")
+        or not result.get("public_id")
+        or result.get("resource_type") != "image"
+        or result.get("format") not in {"jpg", "png", "webp", "gif"}
+        or not isinstance(result.get("bytes"), int)
+        or result["bytes"] > MAX_IMAGE_BYTES
+    ):
+        if result.get("public_id"):
+            try:
+                delete_cloudinary_asset(result["public_id"])
+            except requests.RequestException as error:
+                app.logger.warning("Could not delete rejected Cloudinary image: %s", error)
+        raise ValueError("Cloudinary returned an unsupported image; use JPEG, PNG, WebP, or GIF under 4 MB")
     return result["secure_url"], result["public_id"]
 
 
@@ -144,6 +184,8 @@ def valid_cloudinary_asset(data):
     public_id = data.get("image_public_id")
     token = data.get("image_asset_token")
     image_url = data.get("image_url", "")
+    if not isinstance(image_url, str):
+        return False
     parsed_image = urlparse(image_url)
     expected_path = f"/{CLOUDINARY_CLOUD_NAME}/image/upload/" if CLOUDINARY_CLOUD_NAME else None
     return bool(
@@ -297,6 +339,38 @@ def home():
             ],
         }
     )
+
+
+@app.get("/api/health")
+def health_check():
+    """Test database connectivity. Returns DB status and env var status."""
+    db_status = "unknown"
+    db_error = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        conn.close()
+        db_status = "connected"
+    except Exception as e:
+        db_status = "error"
+        db_error = str(e)
+
+    env_status = {}
+    for var in ["SECRET_KEY", "DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME",
+                "CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET",
+                "MPESA_CONSUMER_KEY", "MPESA_CONSUMER_SECRET", "MPESA_SHORTCODE",
+                "MPESA_PASSKEY", "MPESA_CALLBACK_URL"]:
+        val = os.getenv(var)
+        env_status[var] = "set" if val else "missing"
+
+    return jsonify({
+        "status": "ok" if db_status == "connected" else "degraded",
+        "database": db_status,
+        "database_error": db_error,
+        "environment": env_status,
+    }), 200
 
 
 @app.post("/users")
@@ -482,14 +556,28 @@ def create_product():
         return jsonify({"error": f"Category must be one of: {', '.join(ALLOWED_CATEGORIES)}"}), 400
     image_url = data.get("image_url", "")
     public_id = data.get("image_public_id")
+    imported_public_id = None
     if public_id:
         if not valid_cloudinary_asset(data):
             return jsonify({"error": "Cloudinary image metadata is invalid. Upload the image again."}), 400
-    elif not validate_external_image_url(image_url):
-        return jsonify({"error": "Image URL must be a valid public HTTP or HTTPS URL"}), 400
+    elif validate_external_image_url(image_url):
+        try:
+            image_url, public_id = upload_to_cloudinary(source_url=image_url)
+            imported_public_id = public_id
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 503
+        except ValueError as error:
+            app.logger.warning("Cloudinary product image import failed: %s", error)
+            return jsonify({"error": "Image import failed", "details": str(error)}), 502
+        except requests.RequestException as error:
+            app.logger.warning("Cloudinary product image request failed: %s", error)
+            return jsonify({"error": "Image import failed because Cloudinary could not be reached"}), 502
+    else:
+        return jsonify({"error": "Image must be a Cloudinary upload or a valid public HTTP or HTTPS URL"}), 400
 
-    connection = get_db_connection()
+    connection = None
     try:
+        connection = get_db_connection()
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -507,8 +595,18 @@ def create_product():
             )
             product_id = cursor.lastrowid
         connection.commit()
+    except Exception:
+        if connection:
+            connection.rollback()
+        if imported_public_id:
+            try:
+                delete_cloudinary_asset(imported_public_id)
+            except Exception as cleanup_error:
+                app.logger.warning("Could not delete unreferenced Cloudinary product image: %s", cleanup_error)
+        raise
     finally:
-        connection.close()
+        if connection:
+            connection.close()
 
     return jsonify(fetch_one("SELECT * FROM products WHERE id = %s", (product_id,))), 201
 
@@ -544,7 +642,7 @@ def upload_product_image():
         return jsonify({"error": "Image must be JPEG, PNG, WebP, or GIF"}), 400
     contents = image.read(MAX_IMAGE_BYTES + 1)
     if not contents or len(contents) > MAX_IMAGE_BYTES:
-        return jsonify({"error": "Image must be smaller than 5 MB"}), 400
+        return jsonify({"error": "Image must be smaller than 4 MB"}), 400
     signature = ALLOWED_IMAGE_TYPES[content_type][1]
     if not contents.startswith(signature) or (content_type == "image/webp" and contents[8:12] != b"WEBP"):
         return jsonify({"error": "The selected file does not match its image type"}), 400
@@ -593,13 +691,27 @@ def update_product(product_id):
         return jsonify({"error": "Product not found"}), 404
     replacement_public_id = old.get("image_public_id")
     replacing_image = "image_url" in data
+    imported_public_id = None
     if replacing_image:
         replacement_public_id = data.get("image_public_id")
         if replacement_public_id:
             if not valid_cloudinary_asset(data):
                 return jsonify({"error": "Cloudinary image metadata is invalid. Upload the image again."}), 400
-        elif not validate_external_image_url(data["image_url"]):
-            return jsonify({"error": "Image URL must be a valid public HTTP or HTTPS URL"}), 400
+        elif validate_external_image_url(data["image_url"]):
+            try:
+                replacement_url, replacement_public_id = upload_to_cloudinary(source_url=data["image_url"])
+                data["image_url"] = replacement_url
+                imported_public_id = replacement_public_id
+            except RuntimeError as error:
+                return jsonify({"error": str(error)}), 503
+            except ValueError as error:
+                app.logger.warning("Cloudinary product image import failed: %s", error)
+                return jsonify({"error": "Image import failed", "details": str(error)}), 502
+            except requests.RequestException as error:
+                app.logger.warning("Cloudinary product image request failed: %s", error)
+                return jsonify({"error": "Image import failed because Cloudinary could not be reached"}), 502
+        else:
+            return jsonify({"error": "Image must be a Cloudinary upload or a valid public HTTP or HTTPS URL"}), 400
         updates.append("image_public_id = %s")
         params.append(replacement_public_id)
 
@@ -612,8 +724,9 @@ def update_product(product_id):
         return jsonify({"error": "No valid fields provided"}), 400
 
     params.append(product_id)
-    connection = get_db_connection()
+    connection = None
     try:
+        connection = get_db_connection()
         with connection.cursor() as cursor:
             cursor.execute(
                 f"UPDATE products SET {', '.join(updates)} WHERE id = %s",
@@ -621,10 +734,25 @@ def update_product(product_id):
             )
             if cursor.rowcount == 0:
                 connection.rollback()
+                if imported_public_id:
+                    try:
+                        delete_cloudinary_asset(imported_public_id)
+                    except Exception as cleanup_error:
+                        app.logger.warning("Could not delete unreferenced Cloudinary product image: %s", cleanup_error)
                 return jsonify({"error": "Product not found"}), 404
         connection.commit()
+    except Exception:
+        if connection:
+            connection.rollback()
+        if imported_public_id:
+            try:
+                delete_cloudinary_asset(imported_public_id)
+            except Exception as cleanup_error:
+                app.logger.warning("Could not delete unreferenced Cloudinary product image: %s", cleanup_error)
+        raise
     finally:
-        connection.close()
+        if connection:
+            connection.close()
 
     if replacing_image and old.get("image_public_id") and old["image_public_id"] != replacement_public_id:
         try:
@@ -698,7 +826,7 @@ def get_product_variants(product_id):
 @app.put("/variants/<int:variant_id>")
 def update_product_variant(variant_id):
     data = request.get_json(silent=True) or {}
-    allowed_fields = ["size", "color", "stock_quantity"]
+    allowed_fields = ["size", "color", "stock_quantity", "price", "attributes"]
     updates = []
     params = []
 
@@ -1330,3 +1458,7 @@ def remove_from_wishlist(item_id):
     finally:
         cursor.close()
         conn.close()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
