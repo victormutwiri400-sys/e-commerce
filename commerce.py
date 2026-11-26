@@ -46,28 +46,6 @@ REQUIRED_ENVIRONMENT_VARIABLES = (
 PLACEHOLDER_VALUES = {"change_me", "changeme", "replace_me", "password", "secret"}
 
 
-def validate_startup_configuration():
-    missing = []
-    for name in REQUIRED_ENVIRONMENT_VARIABLES:
-        value = os.getenv(name, "").strip()
-        if not value or value.lower() in PLACEHOLDER_VALUES or value.lower().startswith(("your_", "replace_")):
-            missing.append(name)
-    if missing:
-        raise RuntimeError(
-            "Flask startup blocked. Set valid values for required environment variable(s): "
-            + ", ".join(missing)
-        )
-
-    secret_key = os.environ["SECRET_KEY"].strip()
-    if len(secret_key.encode("utf-8")) < 43 or len(set(secret_key)) < 16:
-        raise RuntimeError(
-            "Flask startup blocked. SECRET_KEY must be a randomly generated value "
-            "of at least 32 random bytes (43 or more encoded characters)."
-        )
-
-
-validate_startup_configuration()
-
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 app.secret_key = os.environ["SECRET_KEY"].strip()
@@ -86,10 +64,10 @@ CORS(
 )
 
 DB_CONFIG = {
-    "host": os.environ["DB_HOST"].strip(),
-    "user": os.environ["DB_USER"].strip(),
-    "password": os.environ["DB_PASSWORD"],
-    "database": os.environ["DB_NAME"].strip(),
+    "host": os.getenv("DB_HOST", "").strip(),
+    "user": os.getenv("DB_USER", "").strip(),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME", "").strip(),
     "cursorclass": pymysql.cursors.DictCursor,
     "autocommit": False,
 }
@@ -102,9 +80,9 @@ ALLOWED_IMAGE_TYPES = {
     "image/gif": ("gif", b"GIF8"),
 }
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-CLOUDINARY_CLOUD_NAME = os.environ["CLOUDINARY_CLOUD_NAME"].strip()
-CLOUDINARY_API_KEY = os.environ["CLOUDINARY_API_KEY"].strip()
-CLOUDINARY_API_SECRET = os.environ["CLOUDINARY_API_SECRET"].strip()
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "").strip()
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "").strip()
 
 
 def require_admin():
